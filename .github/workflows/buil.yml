@@ -1,0 +1,327 @@
+name: Build Kernel
+
+# Save as .github/workflows/build-kernel.yml
+# Run it from: Actions -> "Build Kernel" -> "Run workflow"
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_repo:
+        description: "Kernel source repo (owner/name). Empty = this repo"
+        required: false
+        default: ""
+      kernel_branch:
+        description: "Branch / tag / commit"
+        required: true
+        default: "main"
+      defconfig:
+        description: "Defconfig name (file name only)"
+        required: true
+        default: "realme3263_defconfig"
+      arch:
+        description: "ARCH"
+        required: true
+        default: "arm64"
+        type: choice
+        options: [arm64, arm]
+      toolchain:
+        description: "Toolchain"
+        required: true
+        default: "aosp-clang-r383902b"
+        type: choice
+        options:
+          - aosp-clang-r383902b
+          - ubuntu-clang
+          - custom-url
+      toolchain_url:
+        description: "Only for custom-url: .tar.gz/.tar.xz clang toolchain (needs bin/clang)"
+        required: false
+        default: ""
+
+      # ---------------- KernelSU-Next ----------------
+      ksu_variant:
+        description: "Root solution to integrate"
+        required: true
+        default: "kernelsu-next"
+        type: choice
+        options: [kernelsu-next, none]
+      ksu_branch:
+        description: "KernelSU-Next branch (legacy = old/non-GKI kernels like 4.14)"
+        required: true
+        default: "legacy"
+      ksu_hook:
+        description: "Hook method"
+        required: true
+        default: "kprobes"
+        type: choice
+        options:
+          - kprobes   # automatic, needs CONFIG_KPROBES to work on your kernel
+          - manual    # you patched fs/exec.c etc. yourself; KPROBES gets disabled
+      disable_debug_info:
+        description: "Disable CONFIG_DEBUG_INFO (faster build, smaller disk use)"
+        required: true
+        default: true
+        type: boolean
+
+      # ---------------- Output ----------------
+      image_name:
+        description: "Kernel image file produced by the build"
+        required: true
+        default: "auto"
+        type: choice
+        options: [auto, Image.gz-dtb, Image.gz, Image, Image.lz4]
+      stock_boot_url:
+        description: "Direct URL to your STOCK boot.img (repack base). Empty = use stock/boot.img from the repo"
+        required: false
+        default: ""
+      kernel_name:
+        description: "Name used for output files (e.g. kaiju2_1)"
+        required: true
+        default: "kaiju"
+      release_tag:
+        description: "Release tag to publish to (e.g. v2.1). Empty = only upload as workflow artifact"
+        required: false
+        default: ""
+      extra_make_args:
+        description: "Extra make args (e.g. LTO=thin)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    env:
+      KERNEL_NAME: ${{ inputs.kernel_name }}
+      ARCH: ${{ inputs.arch }}
+      DEFCONFIG: ${{ inputs.defconfig }}
+      KBUILD_BUILD_USER: github-actions
+      KBUILD_BUILD_HOST: github
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: Checkout kernel source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.kernel_repo != '' && inputs.kernel_repo || github.repository }}
+          ref: ${{ inputs.kernel_branch }}
+          path: kernel
+          fetch-depth: 1
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison flex build-essential libssl-dev libelf-dev libncurses-dev \
+            cpio zip unzip xz-utils lz4 zstd rsync python3 git curl wget ccache \
+            device-tree-compiler dwarves \
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi
+          if [ "${{ inputs.toolchain }}" = "ubuntu-clang" ]; then
+            sudo apt-get install -y clang lld llvm
+          fi
+
+      - name: Integrate KernelSU-Next
+        if: ${{ inputs.ksu_variant == 'kernelsu-next' }}
+        working-directory: kernel
+        run: |
+          set -e
+          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s "${{ inputs.ksu_branch }}"
+
+          # setup.sh silently stays on the default branch if the branch name is wrong, so verify
+          test -e drivers/kernelsu || { echo "::error::KernelSU-Next was not linked into drivers/kernelsu"; exit 1; }
+          for d in KernelSU-Next KernelSU; do
+            if [ -d "$d/.git" ]; then
+              echo "== $d =="
+              git -C "$d" branch --show-current || true
+              git -C "$d" log -1 --oneline
+            fi
+          done
+
+      - name: Set up toolchain
+        run: |
+          set -e
+          TC="$HOME/tc"; mkdir -p "$TC"
+          case "${{ inputs.toolchain }}" in
+            aosp-clang-r383902b)
+              git clone --depth=1 --filter=blob:none --sparse -b android11-release \
+                https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 "$TC/clang-src"
+              git -C "$TC/clang-src" sparse-checkout set clang-r383902b
+              echo "CLANG_BIN=$TC/clang-src/clang-r383902b/bin" >> $GITHUB_ENV
+              git clone --depth=1 https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9 "$TC/gcc64"
+              git clone --depth=1 https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_arm_arm-linux-androideabi-4.9 "$TC/gcc32"
+              echo "GCC64_BIN=$TC/gcc64/bin" >> $GITHUB_ENV
+              echo "GCC32_BIN=$TC/gcc32/bin" >> $GITHUB_ENV
+              echo "CROSS64=aarch64-linux-android-" >> $GITHUB_ENV
+              echo "CROSS32=arm-linux-androideabi-" >> $GITHUB_ENV
+              ;;
+            ubuntu-clang)
+              echo "CLANG_BIN=/usr/bin" >> $GITHUB_ENV
+              echo "CROSS64=aarch64-linux-gnu-" >> $GITHUB_ENV
+              echo "CROSS32=arm-linux-gnueabi-" >> $GITHUB_ENV
+              ;;
+            custom-url)
+              test -n "${{ inputs.toolchain_url }}" || { echo "toolchain_url is required"; exit 1; }
+              mkdir -p "$TC/custom"
+              curl -L "${{ inputs.toolchain_url }}" -o "$TC/custom.tar"
+              tar -xf "$TC/custom.tar" -C "$TC/custom"
+              CB=$(dirname "$(find "$TC/custom" -type f -name clang -path '*/bin/*' | head -n1)")
+              echo "CLANG_BIN=$CB" >> $GITHUB_ENV
+              echo "CROSS64=aarch64-linux-gnu-" >> $GITHUB_ENV
+              echo "CROSS32=arm-linux-gnueabi-" >> $GITHUB_ENV
+              ;;
+          esac
+
+      - name: Configure kernel
+        working-directory: kernel
+        run: |
+          set -e
+          export PATH="$CLANG_BIN:${GCC64_BIN:-}:${GCC32_BIN:-}:$PATH"
+          clang --version | head -n1
+
+          MAKE_ARGS=(
+            -j"$(nproc)" O=out ARCH="$ARCH"
+            CC=clang
+            CLANG_TRIPLE=aarch64-linux-gnu-
+            CROSS_COMPILE="$CROSS64"
+            CROSS_COMPILE_ARM32="$CROSS32"
+          )
+          if command -v ld.lld >/dev/null; then
+            MAKE_ARGS+=( LD=ld.lld AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip )
+          fi
+          # shellcheck disable=SC2206
+          MAKE_ARGS+=( ${{ inputs.extra_make_args }} )
+
+          # Save args for the build step
+          printf '%q ' "${MAKE_ARGS[@]}" > "$RUNNER_TEMP/make_args"
+
+          make "${MAKE_ARGS[@]}" "$DEFCONFIG"
+
+          # Apply options AFTER the defconfig so nothing later in the file can override them
+          if [ "${{ inputs.disable_debug_info }}" = "true" ]; then
+            scripts/config --file out/.config -d DEBUG_INFO
+          fi
+
+          if [ "${{ inputs.ksu_variant }}" = "kernelsu-next" ]; then
+            scripts/config --file out/.config -e KSU
+            if [ "${{ inputs.ksu_hook }}" = "kprobes" ]; then
+              scripts/config --file out/.config -e KPROBES
+            else
+              # manual hooks: KPROBES must be OFF, otherwise volume-down at boot can trigger safe mode
+              scripts/config --file out/.config -d KPROBES
+            fi
+          fi
+
+          # Resolve dependencies
+          make "${MAKE_ARGS[@]}" olddefconfig
+
+          echo "---- resulting options ----"
+          grep -E '^(# )?CONFIG_(KSU|KPROBES|HAVE_KPROBES|MODULES|KALLSYMS|OVERLAY_FS)[= ]' out/.config || true
+
+          if [ "${{ inputs.ksu_variant }}" = "kernelsu-next" ]; then
+            grep -q '^CONFIG_KSU=y' out/.config || {
+              echo "::error::CONFIG_KSU is not enabled after olddefconfig. KernelSU-Next was not hooked into Kconfig (check the integrate step)."
+              exit 1
+            }
+            if [ "${{ inputs.ksu_hook }}" = "kprobes" ]; then
+              grep -q '^CONFIG_KPROBES=y' out/.config || {
+                echo "::error::CONFIG_KPROBES could not be enabled (this tree/arch lacks HAVE_KPROBES or its dependencies). Use ksu_hook=manual and patch the hooks into the source."
+                exit 1
+              }
+            fi
+          fi
+
+      - name: Build kernel
+        working-directory: kernel
+        run: |
+          set -e
+          export PATH="$CLANG_BIN:${GCC64_BIN:-}:${GCC32_BIN:-}:$PATH"
+          eval "MAKE_ARGS=( $(cat "$RUNNER_TEMP/make_args") )"
+          make "${MAKE_ARGS[@]}" 2>&1 | tee build.log
+
+      - name: Locate kernel image
+        working-directory: kernel
+        run: |
+          set -e
+          BOOTDIR="out/arch/$ARCH/boot"
+          WANT="${{ inputs.image_name }}"
+          if [ "$WANT" = "auto" ]; then
+            for f in Image.gz-dtb Image.lz4-dtb Image.gz Image.lz4 Image zImage-dtb zImage; do
+              [ -f "$BOOTDIR/$f" ] && WANT="$f" && break
+            done
+          fi
+          test -f "$BOOTDIR/$WANT" || { echo "No kernel image found in $BOOTDIR"; ls -la "$BOOTDIR"; exit 1; }
+          echo "Using $WANT"
+          echo "KIMAGE=$PWD/$BOOTDIR/$WANT" >> $GITHUB_ENV
+          echo "KIMAGE_NAME=$WANT" >> $GITHUB_ENV
+
+      - name: Repack boot.img
+        run: |
+          set -e
+          mkdir -p "$HOME/repack" out
+          cd "$HOME/repack"
+
+          if [ -n "${{ inputs.stock_boot_url }}" ]; then
+            curl -L "${{ inputs.stock_boot_url }}" -o stock_boot.img
+          elif [ -f "$GITHUB_WORKSPACE/kernel/stock/boot.img" ]; then
+            cp "$GITHUB_WORKSPACE/kernel/stock/boot.img" stock_boot.img
+          else
+            echo "::warning::No stock boot.img provided - skipping .img, only the zip will be made"
+            exit 0
+          fi
+
+          # magiskboot (extracted from the Magisk APK)
+          curl -L https://github.com/topjohnwu/Magisk/releases/download/v27.0/Magisk-v27.0.apk -o magisk.apk
+          unzip -o -j magisk.apk 'lib/x86_64/libmagiskboot.so' -d .
+          mv libmagiskboot.so magiskboot && chmod +x magiskboot
+
+          ./magiskboot unpack stock_boot.img
+          cp "$KIMAGE" ./kernel
+          ./magiskboot repack stock_boot.img new-boot.img
+
+          cp new-boot.img "$GITHUB_WORKSPACE/out/${KERNEL_NAME}.img"
+          ls -lh "$GITHUB_WORKSPACE/out"
+
+      - name: Make AnyKernel3 zip
+        run: |
+          set -e
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3 ak3
+          cd ak3
+          rm -rf .git .github README.md
+          cp "$KIMAGE" "./$KIMAGE_NAME"
+          sed -i "s|^kernel.string=.*|kernel.string=${KERNEL_NAME} by ${GITHUB_ACTOR}|" anykernel.sh
+          sed -i "s|^do.devicecheck=.*|do.devicecheck=0|" anykernel.sh
+          sed -i "s|^do.modules=.*|do.modules=0|" anykernel.sh
+          zip -r9 "$GITHUB_WORKSPACE/out/${KERNEL_NAME}-AnyKernel3.zip" . -x '*.git*'
+
+      - name: Checksums
+        working-directory: out
+        run: sha256sum * | tee sha256sums.txt
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.kernel_name }}-build
+          path: |
+            out/*
+            kernel/build.log
+
+      - name: Publish release
+        if: ${{ inputs.release_tag != '' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.release_tag }}
+          name: ${{ inputs.kernel_name }} ${{ inputs.release_tag }}
+          body: |
+            Kernel: ${{ inputs.kernel_name }}
+            Defconfig: ${{ inputs.defconfig }}
+            Toolchain: ${{ inputs.toolchain }}
+            Root: ${{ inputs.ksu_variant }} (${{ inputs.ksu_branch }}, hooks: ${{ inputs.ksu_hook }})
+            Source: ${{ inputs.kernel_repo != '' && inputs.kernel_repo || github.repository }} @ ${{ inputs.kernel_branch }}
+          files: |
+            out/*
