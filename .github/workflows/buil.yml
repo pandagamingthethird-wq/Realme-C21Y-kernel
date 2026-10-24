@@ -17,7 +17,7 @@ on:
       defconfig:
         description: "Defconfig name (file name only)"
         required: true
-        default: "realme3263_defconfig"
+        default: "rmx3263_defconfig"
       arch:
         description: "ARCH"
         required: true
