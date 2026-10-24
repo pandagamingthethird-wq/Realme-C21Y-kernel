@@ -1,3 +1,6 @@
+# Implement Kernel Su Next
+CONFIG_KSU=y
+
 #
 # Automatically generated file; DO NOT EDIT.
 # Linux/arm64 4.14.193 Kernel Configuration
